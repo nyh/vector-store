@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+mod alternator;
 mod ann;
 mod auth;
 mod cdc;
@@ -23,6 +24,19 @@ use vector_search_validator_tests::TestCase;
 #[framed]
 pub async fn test_cases() -> impl Iterator<Item = (String, TestCase)> {
     vec![
+        (
+            "alternator_create_table",
+            alternator::create_table::new().await,
+        ),
+        (
+            "alternator_delete_table",
+            alternator::delete_table::new().await,
+        ),
+        ("alternator_query", alternator::query::new().await),
+        (
+            "alternator_update_table",
+            alternator::update_table::new().await,
+        ),
         ("ann", ann::new().await),
         ("auth", auth::new().await),
         ("cdc", cdc::new().await),
