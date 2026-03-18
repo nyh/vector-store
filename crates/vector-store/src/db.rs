@@ -110,6 +110,7 @@ pub enum Db {
         keyspace: KeyspaceName,
         table: TableName,
         target_column: ColumnName,
+        index: IndexName,
         tx: oneshot::Sender<GetIndexTargetTypeR>,
     },
 
@@ -152,6 +153,7 @@ pub(crate) trait DbExt {
         keyspace: KeyspaceName,
         table: TableName,
         target_column: ColumnName,
+        index: IndexName,
     ) -> GetIndexTargetTypeR;
 
     async fn get_index_params(
@@ -205,12 +207,14 @@ impl DbExt for mpsc::Sender<Db> {
         keyspace: KeyspaceName,
         table: TableName,
         target_column: ColumnName,
+        index: IndexName,
     ) -> GetIndexTargetTypeR {
         let (tx, rx) = oneshot::channel();
         self.send(Db::GetIndexTargetType {
             keyspace,
             table,
             target_column,
+            index,
             tx,
         })
         .await?;
@@ -437,11 +441,12 @@ async fn process(
             keyspace,
             table,
             target_column,
+            index,
             tx,
         } => tx
             .send(
                 statements
-                    .get_index_target_type(keyspace, table, target_column)
+                    .get_index_target_type(keyspace, table, target_column, index)
                     .await,
             )
             .unwrap_or_else(|_| trace!("process: Db::GetIndexTargetType: unable to send response")),
@@ -701,7 +706,7 @@ impl Statements {
                             anyhow!("table {table_name} does not exist").context(InvalidMetadata)
                         })?;
                     Ok(options.remove("target").and_then(|target| {
-                        from_target_option(table, target)
+                        from_target_option(table, target, &keyspace_name)
                             .map(
                                 |(index_type, target_column, filtering_columns)| DbCustomIndex {
                                     keyspace: keyspace_name.into(),
@@ -743,13 +748,21 @@ impl Statements {
         keyspace: KeyspaceName,
         table: TableName,
         target_column: ColumnName,
+        index: IndexName,
     ) -> GetIndexTargetTypeR {
         let session = self
             .session_rx
             .borrow()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-        Ok(session
+
+        if keyspace.is_alternator() {
+            return self
+                .get_dimensions_from_index_options(&session, keyspace, table, index)
+                .await;
+        }
+
+        let column_type = session
             .execute_iter(
                 self.st_get_index_target_type.clone(),
                 (keyspace, table, target_column),
@@ -757,7 +770,8 @@ impl Statements {
             .await?
             .rows_stream::<(String,)>()?
             .try_next()
-            .await?
+            .await?;
+        let dimensions = column_type
             .and_then(|(typ,)| {
                 self.re_get_index_target_type
                     .captures(&typ)
@@ -765,7 +779,33 @@ impl Statements {
             })
             .and_then(|dimensions| {
                 NonZeroUsize::new(dimensions).map(|dimensions| dimensions.into())
-            }))
+            });
+        Ok(dimensions)
+    }
+
+    async fn get_dimensions_from_index_options(
+        &self,
+        session: &Session,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetIndexTargetTypeR {
+        let index_options = session
+            .execute_iter(self.st_get_index_options.clone(), (keyspace, table, index))
+            .await?
+            .rows_stream::<(BTreeMap<String, String>,)>()?
+            .try_next()
+            .await?;
+        let dimensions = index_options
+            .and_then(|(mut options,)| {
+                options
+                    .remove("dimensions")
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
+            .and_then(|dimensions| {
+                NonZeroUsize::new(dimensions).map(|dimensions| dimensions.into())
+            });
+        Ok(dimensions)
     }
 
     const ST_GET_INDEX_OPTIONS: &str = "
@@ -916,18 +956,29 @@ struct TargetOption {
 fn from_target_option(
     table: &Table,
     value: String,
+    keyspace: &str,
 ) -> anyhow::Result<(DbIndexType, ColumnName, Vec<ColumnName>)> {
     let Ok(mut target_option) = serde_json::from_str::<TargetOption>(&value) else {
         // Global index with a single target column
         return Ok((DbIndexType::Global, value.into(), vec![]));
     };
 
+    let is_alternator = keyspace.starts_with("alternator_");
     let validate_target_type = |target_name: &str| -> anyhow::Result<()> {
         let column = table.columns.get(target_name).ok_or_else(|| {
             anyhow!("invalid target option: column {target_name} does not exist in a table")
         })?;
         if !matches!(column.typ, ColumnType::Vector { .. }) {
-            bail!("invalid target option: column {target_name} is not a vector column in a table");
+            if is_alternator {
+                debug!(
+                    "Alternator column {target_name} has type {:?}, dimensions will be read from index options",
+                    column.typ
+                );
+            } else {
+                bail!(
+                    "invalid target option: column {target_name} is not a vector column in a table"
+                );
+            }
         }
         Ok(())
     };
@@ -1004,6 +1055,7 @@ pub(crate) mod tests {
             keyspace: KeyspaceName,
             table: TableName,
             target_column: ColumnName,
+            index: IndexName,
             tx: oneshot::Sender<GetIndexTargetTypeR>,
         ) -> impl Future<Output = ()> + Send + 'static;
 
@@ -1052,9 +1104,10 @@ pub(crate) mod tests {
                             keyspace,
                             table,
                             target_column,
+                            index,
                             tx,
                         } => {
-                            sim.get_index_target_type(keyspace, table, target_column, tx)
+                            sim.get_index_target_type(keyspace, table, target_column, index, tx)
                                 .await
                         }
 
