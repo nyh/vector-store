@@ -148,6 +148,14 @@ pub struct Credentials {
 /// A keyspace name in a db.
 pub struct KeyspaceName(String);
 
+impl KeyspaceName {
+    /// Returns true if this keyspace is backed by Alternator (DynamoDB-compatible API).
+    /// Alternator keyspaces are prefixed with `alternator_`.
+    pub fn is_alternator(&self) -> bool {
+        self.0.starts_with("alternator_")
+    }
+}
+
 impl SerializeValue for KeyspaceName {
     fn serialize<'b>(
         &self,
@@ -536,6 +544,11 @@ pub struct IndexMetadata {
 impl IndexMetadata {
     pub fn key(&self) -> IndexKey {
         IndexKey::new(&self.keyspace_name, &self.index_name)
+    }
+
+    /// Returns true if this index is backed by Alternator (DynamoDB-compatible API).
+    pub fn is_alternator(&self) -> bool {
+        self.keyspace_name.is_alternator()
     }
 }
 
